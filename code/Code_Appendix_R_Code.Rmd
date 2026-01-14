@@ -1,0 +1,404 @@
+# load packages
+```{r}
+library(tidyverse)
+library(dplyr)
+```
+
+# load data
+```{r}
+retail <- read_csv("~/Downloads/online_retail_data.csv")
+```
+
+
+# clean and prep data
+```{r}
+###############################################################################
+# 1. CLEAN RAW DATA
+###############################################################################
+
+# Fix column name
+retail <- retail %>%
+  rename(CustomerID = `Customer ID`)
+
+# Remove rows where CustomerID is missing
+retail <- retail %>%
+  filter(!is.na(CustomerID))
+
+# Convert variables
+retail <- retail %>%
+  mutate(
+    InvoiceDate = as.POSIXct(InvoiceDate, format = "%m/%d/%Y %H:%M"),
+    CustomerID  = as.factor(CustomerID),
+    Country     = as.factor(Country)
+  )
+
+# Define analysis date for recency
+analysis_date <- max(retail$InvoiceDate)
+
+
+
+###############################################################################
+# 2. SEPARATE PURCHASES AND RETURNS
+###############################################################################
+
+# eliminate impossible quantities
+retail <- retail %>%
+  filter(Quantity < 500)
+
+# Purchase invoices = Quantity > 0
+purchase_data <- retail %>%
+  filter(Quantity > 0)
+
+# Returns = Quantity < 0
+return_data <- retail %>%
+  filter(Quantity < 0)
+
+
+###############################################################################
+# 3. CUSTOMER-LEVEL FEATURE CREATION (PURCHASE-ONLY)
+###############################################################################
+
+customer_data <- purchase_data %>%
+  group_by(CustomerID) %>%
+  summarise(
+    repeat_purchase = if_else(n_distinct(Invoice) > 1, 1, 0),
+    n_purchases = n_distinct(Invoice),
+    total_spent = sum(Quantity * Price, na.rm = TRUE),
+    avg_spent_per_purchase = total_spent / n_purchases,
+    first_purchase = min(InvoiceDate),
+    last_purchase  = max(InvoiceDate),
+    recency_days = as.numeric(analysis_date - max(InvoiceDate), units = "days"),
+    customer_lifetime_days =
+      as.numeric(max(InvoiceDate) - min(InvoiceDate), units = "days"),
+    avg_qty = mean(Quantity, na.rm = TRUE),
+    Country = first(Country)
+  ) %>%
+  ungroup()
+
+
+
+
+###############################################################################
+# 4. ADD RETURN BEHAVIOR (FROM return_data)
+###############################################################################
+
+# Did the customer EVER return something?
+return_flags <- return_data %>%
+  group_by(CustomerID) %>%
+  summarise(any_return = 1)
+
+# Join return indicator (customers with no returns get NA → replace with 0)
+customer_data <- customer_data %>%
+  left_join(return_flags, by = "CustomerID") %>%
+  mutate(any_return = if_else(is.na(any_return), 0, any_return))
+
+
+
+########################################
+#########################################
+# EDA
+####################################
+#######################################
+
+# Check summary statistics
+customer_data %>%
+  select(repeat_purchase,n_purchases,total_spent,recency_days, customer_lifetime_days) %>%summary()
+
+# Print the Prop of Repeat Purchases
+repeat_counts<- table(customer_data$repeat_purchase)
+repeat_prop <-prop.table(repeat_counts)
+print(repeat_counts)
+print("Proportion of Repeat Purchasers: %.2f%%\n", repeat_prop["1"] * 100)
+
+# Distribution of Recency
+p1<-customer_data %>%
+  ggplot(aes(x = recency_days,fill = factor(repeat_purchase))) +
+  geom_histogram(binwidth = 30, position = "stack") +
+  labs(title = "Distribution of Recency by Repeat Purchase Status",
+    x= "Recency ",
+    y ="Number of Customers",
+    fill ="Repeat Purchase (1=Yes)")
+
+# Distribution of Total Spent
+p2 <-customer_data %>%
+  ggplot(aes(x = total_spent, fill = factor(repeat_purchase))) +
+  geom_histogram(binwidth = 500, position = "identity", alpha = 0.6) + labs(title = "Distribution of Total Spent (Zoomed)",
+    x = "Total Spent (£)",
+    y = "Number of Customers",
+    fill = "Repeat Purchase (1=Yes)") + xlim(0, 5000)
+print(p1)
+print(p2)
+
+
+#Looking at mean values
+customer_data %>%
+  group_by(repeat_purchase) %>%
+  summarise(
+    Mean_Recency= mean(recency_days),
+    Mean_Total_Spent = mean(total_spent),
+    Mean_Invoices = mean(n_purchases),
+    Proportion_Returned = mean(any_return))
+
+# Correlation matrix
+cor_matrix <-customer_data %>%
+  select(repeat_purchase,n_purchases, total_spent, avg_spent_per_purchase,
+         recency_days,customer_lifetime_days, avg_qty) %>% cor()
+print(cor_matrix)
+
+# Looking at distribution of Country variable
+customer_data%>%
+  count(Country, sort = TRUE) %>%
+  top_n(10, n)
+customer_data%>%
+  group_by(Country) %>%
+  filter(n()> 100) %>% 
+  summarise(
+    Customer_Count= n(),
+    Repeat_Rate= mean(repeat_purchase)) %>%
+  arrange(desc(Repeat_Rate))
+###############################################################################
+# 5. RESULT
+###############################################################################
+
+# customer_data now contains:
+# CustomerID
+# repeat_purchase
+# n_invoices
+# total_spent
+# first_purchase
+# last_purchase
+# avg_spent_per_purchase
+# recency_days
+# customer_lifetime_days
+# avg_qty
+# Country
+# any_return
+
+
+```
+
+# ridge regression
+## split data
+```{r}
+set.seed(123)  # reproducible split
+
+n <- nrow(customer_data)
+train_idx <- sample(1:n, size = 0.7*n)
+
+train <- customer_data[train_idx, ]
+test  <- customer_data[-train_idx, ]
+
+```
+
+# ridge regression
+```{r}
+library(glmnet)
+
+X_train <- model.matrix(
+  repeat_purchase ~ avg_spent_per_purchase + recency_days +
+    customer_lifetime_days + avg_qty + any_return + Country,
+  data = train
+)[, -1]
+
+y_train <- train$repeat_purchase
+
+logit_pen <- cv.glmnet(
+  X_train, y_train,
+  family = "binomial",
+  alpha = 0   # ridge regression
+)
+
+X_test <- model.matrix(
+  repeat_purchase ~ avg_spent_per_purchase + recency_days +
+    customer_lifetime_days + avg_qty + any_return + Country,
+  data = test
+)[, -1]
+
+prob_test <- predict(logit_pen, newx = X_test, s = "lambda.min", type="response")
+pred_test <- ifelse(prob_test > 0.5, 1, 0)
+```
+
+# results
+```{r}
+mean(pred_test == test$repeat_purchase)
+table(Predicted = pred_test, Actual = test$repeat_purchase)
+```
+
+
+Random Forest (R)
+
+```{r}
+#Set up =============================================
+
+#Load in packages
+library(dplyr) #Data manipulation
+library(tidyr) #Data manipulation
+#install.packages("tree", repos="http://cran.us.r-project.org")
+#install.packages("randomForest", repos="http://cran.us.r-project.org")
+library(tree) #tree()
+library(randomForest) #randomForest()
+
+#First Purchase Data ================================
+
+firstPurchaseDf <- read.csv('customer_first_purchase.csv')
+
+#Factor categorical columns and recategorize countries
+#tree() function cannot handle more than approx. 30 levels and there are over that many countries listed
+firstPurchaseDf <- firstPurchaseDf |> mutate(Repeats = factor(ifelse(repeat_purchase == 1, 'Yes', 'No')),
+            Region = case_when(Country %in% c("United Kingdom", "EIRE", "Channel Islands") ~ "UK_Ireland",
+                            Country %in% c("France", "Germany", "Belgium","Netherlands", "Switzerland", "Austria") ~ 'Western_Europe',
+                            Country %in% c("Sweden", "Denmark", "Finland", "Norway", "Iceland") ~ 'Northern_Europe',
+                            Country %in% c("Spain", "Italy", "Portugal", "Greece", "Malta") ~ 'Southern_Europe',
+                            Country %in% c("Poland", "Czech Republic", "Lithuania") ~ 'Eastern_Europe',
+                            Country %in% c("Israel", "Saudi Arabia", "United Arab Emirates", "Lebanon", "Bahrain") ~ 'Middle_East',
+                            Country %in% c("Japan", "Singapore", "Australia") ~ 'Asia_Pacific',
+                            Country %in% c("USA", "Canada", "Brazil") ~ 'Americas',
+                            Country == "RSA" ~ 'Africa'),
+            Region = factor(replace_na(Region, 'Other')))
+
+colnames(firstPurchaseDf)
+#remove CustomerID, repeat_purchases, and Country columns
+firstPurchaseDf <- firstPurchaseDf[,-c(1,9,10)]
+colnames(firstPurchaseDf)
+
+#Classification Decision Trees =============================================
+firstDecTree <- tree(Repeats ~ ., firstPurchaseDf)
+#summary(firstDecTree)
+
+#Calculate accuracy
+set.seed(1)
+firstTrainSample <- sample(1:nrow(firstPurchaseDf), nrow(firstPurchaseDf)/2)
+firstTestDf <- firstPurchaseDf[-firstTrainSample,] #training data
+firstRepeatTest <- firstTestDf$Repeats #test data
+tree.first <- tree(Repeats ~ ., firstPurchaseDf, subset = firstTrainSample) #decision tree
+first.tree.pred <- predict(tree.first, firstTestDf, type = 'class')
+table(first.tree.pred, firstRepeatTest) #confusion matrix
+
+accuracy <- (0+1420)/(0+1420+750+0) #0.6543779
+sensitivity <- (1420)/(1420+0) #1 (TP/(TP+FN))
+specificity <- (0)/(0+750) #0 (TN/(TN+FP))
+
+#Cannot prune single node decision tree
+
+#Random Forest =============================================
+set.seed(1)
+firstRFTree <- randomForest(Repeats ~.,
+    data = firstPurchaseDf,
+    subset = firstTrainSample,
+    mtry = 6,
+    ntree = 1000,
+    importance = TRUE)
+firstRFTree
+
+accuracy = (124+1234)/(124+1234+191+620) #0.626095
+sensitivity <- (1234)/(1234+620) #0.6655879
+specificity <- (124)/(124+191) #0.3936508
+
+
+
+#===============================================#
+
+
+
+#Customer Data ================================
+
+
+#Load in Data
+aggCustomerDf <- read.csv('customer_data.csv')
+
+#Factor categorical columns and recategorize countries
+#tree() function cannot handle more than approx. 30 levels and there are over that many countries listed
+aggCustomerDf <- aggCustomerDf |> mutate(Repeats = factor(ifelse(repeat_purchase == 1, 'Yes', 'No')),
+            Country = factor(Country),
+            CustomerID = factor(CustomerID),
+            Region = case_when(Country %in% c("United Kingdom", "EIRE", "Channel Islands") ~ "UK_Ireland",
+                            Country %in% c("France", "Germany", "Belgium","Netherlands", "Switzerland", "Austria") ~ 'Western_Europe',
+                            Country %in% c("Sweden", "Denmark", "Finland", "Norway", "Iceland") ~ 'Northern_Europe',
+                            Country %in% c("Spain", "Italy", "Portugal", "Greece", "Malta") ~ 'Southern_Europe',
+                            Country %in% c("Poland", "Czech Republic", "Lithuania") ~ 'Eastern_Europe',
+                            Country %in% c("Israel", "Saudi Arabia", "United Arab Emirates", "Lebanon", "Bahrain") ~ 'Middle_East',
+                            Country %in% c("Japan", "Singapore", "Australia") ~ 'Asia_Pacific',
+                            Country %in% c("USA", "Canada", "Brazil") ~ 'Americas',
+                            Country == "RSA" ~ 'Africa'),
+            Region = factor(replace_na(Region, 'Other')),
+            Returns = factor(ifelse(any_return == 1, 'Yes', 'No')))
+
+colnames(aggCustomerDf)
+#Remove multicollinear columns to Repeats: repeat_purchase, n_purchases, total_spent, customer_lifetime_days
+#Since data has been grouped together by customer, whether a customer has bought from the company more than once
+#is directly related to the number of purchases (n_purchase), the amount of money they have given the store (total_spent),
+#and how long they have been a customer (customer_lifetime_days).
+#Remove columns with too many levels for tree() functions to handle: CustomerID, Country
+aggCustomerDf <- aggCustomerDf[,-c(1,2,3,4,9,11,12)]
+colnames(aggCustomerDf)
+
+#Classification Decision Trees =============================================
+aggDecTree <- tree(Repeats ~ ., aggCustomerDf)
+summary(aggDecTree)
+
+#Calculate accuracy
+set.seed(1)
+aggTrainSample <- sample(1:nrow(aggCustomerDf), nrow(aggCustomerDf)/2)
+aggTestDf <- aggCustomerDf[-aggTrainSample,] #training data
+aggRepeatsTest <- aggTestDf$Repeats #test data
+tree.agg <- tree(Repeats ~ ., aggCustomerDf, subset = aggTrainSample) #decision tree
+tree.agg.pred <- predict(tree.agg, aggTestDf, type = 'class')
+table(tree.agg.pred, aggRepeatsTest) #confusion matrix
+
+accuracy <- (277+1327)/(277+1327+462+97) #0.7415626
+sensitivity <- (1327)/(1327+97) #0.931882
+specificity <- (277)/(277+462) #0.3748309
+
+#Prune the decision tree
+cv.tree(tree.agg, FUN = prune.misclass) #2 is the best size
+aggPrunedTree <- prune.misclass(tree.agg, best = 2)
+aggPredPrune <- predict(aggPrunedTree, aggTestDf, type = 'class')
+table(aggPredPrune, aggRepeatsTest)
+
+
+
+accuracy <- (277+1327)/(277+1327+462+97) #0.7415626 (no change)
+sensitivity <- (1327)/(1327+97) #0.931882
+specificity <- (277)/(277+462) #0.3748309
+
+
+#Random Forest =============================================
+set.seed(1)
+aggRFTree <- randomForest(Repeats ~.,
+    data = aggCustomerDf,
+    subset = aggTrainSample,
+    mtry = 6,
+    ntree = 1000,
+    importance = TRUE)
+aggRFTree
+
+accuracy = (745+1340)/(745+1340+12+66) #0.963939
+sensitivity <- (1340)/(1340+12) #0.9911243
+specificity <- (745)/(745+66) #0.918619
+
+
+#Compare Plots ===============================================
+
+#Compare random forest plots between first purchase data and aggregated customer data
+plot(firstRFTree)
+plot(aggRFTree)
+
+#Compare aggregate data decision trees before and after pruning
+plot(aggDecTree)
+text(aggDecTree, pos = 3)
+
+plot(aggPrunedTree)
+text(aggPrunedTree, pos = 3)
+
+#Compare decision and random forest tree for aggregated data
+plot(aggDecTree)
+plot(aggRFTree)
+
+#Compare random forest importance of variables
+importance(firstRFTree)
+importance(aggRFTree)
+
+varImpPlot(firstRFTree)
+varImpPlot(aggRFTree)
+
+```
